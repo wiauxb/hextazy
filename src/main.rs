@@ -202,12 +202,12 @@ fn handle_keyboard_inputs(mut app: App, terminal: &mut Terminal<CrosstermBackend
 				KeyEvent {
 					modifiers: KeyModifiers::CONTROL,
 					code: KeyCode::Up,  ..
-				} => {app.change_cursor(-0x40)},
+				} => {app.change_cursor(-(app.bytes_per_row as i64 * 2 * 4))},
 
 				KeyEvent {
 					modifiers: KeyModifiers::CONTROL,
 					code: KeyCode::Down,  ..
-				} => {app.change_cursor(0x40)},
+				} => {app.change_cursor(app.bytes_per_row as i64 * 2 * 4)},
 
 				// Alt + Left / Right: move selection by 1 bytes
 				KeyEvent {
@@ -224,13 +224,12 @@ fn handle_keyboard_inputs(mut app: App, terminal: &mut Terminal<CrosstermBackend
 				KeyEvent {
 					modifiers: KeyModifiers::ALT,
 					code: KeyCode::Down,  ..
-				} => {app.move_selection(0x20); continue;},
+				} => {app.move_selection(app.bytes_per_row as i64 * 2); continue;},
 
 				KeyEvent {
 					modifiers: KeyModifiers::ALT,
 					code: KeyCode::Up,  ..
-				} => {app.move_selection(-0x20); continue;},
-
+				} => {app.move_selection(-(app.bytes_per_row as i64 * 2)); continue;},
 
 				// Shift + N: go to previous search result
 				KeyEvent {
@@ -293,10 +292,11 @@ fn handle_keyboard_inputs(mut app: App, terminal: &mut Terminal<CrosstermBackend
 					modifiers: KeyModifiers::CONTROL,
 					code: KeyCode::Home,  ..
 				} => {
+					let bpr = app.bytes_per_row;
 					// use the to stay on the same 'char' of the hex character
 					let cursor_on_second_char = app.cursor % 2;
 
-					app.jump_to(app.cursor / 2 % 0x10);
+					app.jump_to(app.cursor / 2 % bpr);
 
 					app.cursor += cursor_on_second_char;
 					continue;
@@ -307,8 +307,9 @@ fn handle_keyboard_inputs(mut app: App, terminal: &mut Terminal<CrosstermBackend
 					modifiers: KeyModifiers::CONTROL,
 					code: KeyCode::End,  ..
 				} => {
-					let size_of_last_line = app.file_size % 0x10;
-					let column_of_cursor = app.cursor / 2 % 0x10;
+					let bpr = app.bytes_per_row;
+					let size_of_last_line = app.file_size % bpr;
+					let column_of_cursor = app.cursor / 2 % bpr;
 
 					// use the to stay on the same 'char' of the hex character
 					let cursor_on_second_char = app.cursor % 2;
@@ -323,7 +324,7 @@ fn handle_keyboard_inputs(mut app: App, terminal: &mut Terminal<CrosstermBackend
 					// we go on the line just before the last one
 					else {
 						app.jump_to(
-							app.file_size - size_of_last_line - 0x10 + column_of_cursor
+    						app.file_size - size_of_last_line - bpr + column_of_cursor
 						);
 					}
 
@@ -338,28 +339,30 @@ fn handle_keyboard_inputs(mut app: App, terminal: &mut Terminal<CrosstermBackend
 
 				// Move the cursor
 				KeyCode::Down => {
+					let bpr = app.bytes_per_row as i64;
 					// if we are on the last line, also move the screen down
-					let current_line = (app.cursor.saturating_sub(app.offset * 2)) / 32;
+					let current_line = (app.cursor.saturating_sub(app.offset * 2)) / (bpr as u64 * 2);
 
 					if current_line == (app.lines_displayed-1).into() {
-						app.change_offset(0x10)
+						app.change_offset(bpr)
 					}
 
 					// move the cursor down
-					app.change_cursor(0x20)
+					app.change_cursor(bpr * 2)
 				},
 				KeyCode::Up => {
+					let bpr = app.bytes_per_row as i64;
 					// don't change cursor if we are on the last line of the file
-					if app.cursor < 0x1f {
+					if app.cursor < (bpr as u64 * 2 - 1) {
 						continue;
 					}
 
 					// if we are on the first line, also move the screen up
-					if (app.cursor.saturating_sub(app.offset*2)) / 32 == 0 {
-						app.change_offset(-0x10);
+					if (app.cursor.saturating_sub(app.offset*2)) / (bpr as u64 * 2) == 0 {
+						app.change_offset(-bpr);
 					}
-					
-					app.change_cursor(-0x20);				
+
+					app.change_cursor(-(bpr * 2));
 				},
 				KeyCode::Right => {
 					match app.editor_mode {
@@ -547,10 +550,9 @@ fn handle_keyboard_inputs(mut app: App, terminal: &mut Terminal<CrosstermBackend
 
 				// Jump by a whole screen
 				KeyCode::PageDown => {
-					// we jump by a whole screen
-					let offset_to_jump = (app.lines_displayed-1) * 0x10;
-					// convert to i64
-					let offset_to_jump: i64 = offset_to_jump.into();
+                    // we jump by a whole screen
+    				let bpr = app.bytes_per_row as i64;
+					let offset_to_jump = i64::from(app.lines_displayed - 1) * bpr;
 					
 					app.change_offset(offset_to_jump);
 					app.change_cursor(offset_to_jump*2);
@@ -558,23 +560,24 @@ fn handle_keyboard_inputs(mut app: App, terminal: &mut Terminal<CrosstermBackend
 
 				// Jump by a whole screen
 				KeyCode::PageUp => {
-					let offset_to_jump = (app.lines_displayed-1) * 0x10;
-					// convert to i64
-					let offset_to_jump: i64 = offset_to_jump.into();
-					
+					let bpr = app.bytes_per_row as i64;
+					let offset_to_jump = i64::from(app.lines_displayed - 1) * bpr;
+
 					app.change_offset(-offset_to_jump);
 					app.change_cursor(-offset_to_jump*2);
 				},
 
 				// Go to start of the line
 				KeyCode::Home => {
-					app.cursor_jump_to(app.cursor - (app.cursor % 0x20));
+					let bpr_nibbles = app.bytes_per_row * 2;
+					app.cursor_jump_to(app.cursor - (app.cursor % bpr_nibbles));
 				},
 				
 				// Go to end of the line
 				KeyCode::End => {
-					app.cursor_jump_to(app.cursor - (app.cursor % 0x20) + 0x1f);
-				},
+					let bpr_nibbles = app.bytes_per_row * 2;
+					app.cursor_jump_to(app.cursor - (app.cursor % bpr_nibbles) + bpr_nibbles - 1);
+				}
 
 				// switch between Hex and Ascii editor
 				KeyCode::Tab => { 

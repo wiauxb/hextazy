@@ -84,6 +84,7 @@ pub struct App {
 	pub cursor: u64,		// position of the cursor on the interface
 	pub lines_displayed: u16, // the number of lines currently displayed 
 							  // by the interface
+	pub bytes_per_row: u64, // number of bytes per row (set by the UI based on terminal width)
 	pub editor_mode: CurrentEditor,
 	pub command_bar: Option<CommandBar>,
 	pub search_results: Option<SearchResults>,
@@ -158,6 +159,7 @@ impl App {
 			file_size: size,
 			cursor: 0,
 			lines_displayed: 20, // updated when the ui is created
+			bytes_per_row: 16,   // updated when the ui is created
 			editor_mode: CurrentEditor::HexEditor,
 			command_bar: None,
 			search_results: None,
@@ -897,8 +899,8 @@ impl App {
 		}
 	}
 
-	// read 16 bytes, and return the length
-	pub fn read_16_length(&mut self) -> (Vec<u8>, usize) {
+	// read n bytes, and return the length
+	pub fn read_n_length(&mut self, n: usize) -> (Vec<u8>, usize) {
 		let mut bytes: Vec<u8> = vec![];
 
 		let mut current_address = self.last_address_read;
@@ -907,8 +909,8 @@ impl App {
 		if current_address == self.file_size {
 			return (vec![], 0);
 		}
-		
-		for _ in 0..16 {
+
+		for _ in 0..n {
 			// return byte from the file, or modified byte from `self.modified_bytes`
 			match self.read_byte_addr(current_address) {
 				Ok(val) => bytes.push(val),
@@ -931,7 +933,9 @@ impl App {
 
 	// self.offset = self.offset + direction
 	// but we check if the result is bellow 0 or lager than the file
-	pub fn change_offset(&mut self, direction:i64) {
+	pub fn change_offset(&mut self, direction: i64) {
+		let bpr = self.bytes_per_row;
+
 		// check if result is bellow 0
 		if direction.wrapping_add_unsigned(self.offset.into()) < 0 {
 			self.offset = 0;
@@ -941,18 +945,17 @@ impl App {
 		self.offset = self.offset.wrapping_add_signed(direction.into());
 
 		// if offset is beyond the end of file, fix it
-		if self.offset > self.file_size.saturating_sub(0x10) {
-
+		if self.offset > self.file_size.saturating_sub(bpr) {
 			// handle the last line proprely
-			if self.file_size % 0x10 == 0 { 
-				self.offset = self.file_size - 0x10;
+			if self.file_size % bpr == 0 {
+				self.offset = self.file_size - bpr;
 			} else {
-				self.offset = self.file_size - (self.file_size % 0x10);
+				self.offset = self.file_size - (self.file_size % bpr);
 
 				// handle the case where the cursor is just before the last line,
 				// but can't go down without exceeding file size.
 				if self.offset * 2 > self.cursor {
-					self.offset = self.offset - 0x10;
+					self.offset = self.offset - bpr;
 				}
 			}
 		}
@@ -960,10 +963,13 @@ impl App {
 
 	// self.cursor = self.cursor + direction
 	// but we check if the address is bellow 0 or lager than the file
-	pub fn change_cursor(&mut self, direction:i64){
+	pub fn change_cursor(&mut self, direction: i64) {
+		let bpr = self.bytes_per_row;
+		let bpr_nibbles = bpr * 2; // bytes_per_row expressed in nibbles (cursor units)
+
 		// check the address is bellow 0
 		if direction.wrapping_add_unsigned(self.cursor.into()) < 0 {
-			self.cursor = 0 + (self.cursor % 0x20);
+			self.cursor = 0 + (self.cursor % bpr_nibbles);
 			return;
 		}
 
@@ -979,36 +985,35 @@ impl App {
 		// check if the new cursor address is longer than the file
 		// (file_size * 2) - 1 because we have 2 chars for each hex number.
 		if self.cursor.wrapping_add_signed(direction.into()) > end_of_file.saturating_sub(1) {
-
-			//  + (self.cursor % 0x20) = stay on the same column
+			//  + (self.cursor % bpr_nibbles) = stay on the same column
 
 			// case where the last line is an exact fit
-			if end_of_file % 0x20 == 0 {
-				self.cursor = end_of_file.saturating_sub(0x20) + (self.cursor % 0x20); // stay on the same column
+			if end_of_file % bpr_nibbles == 0 {
+				self.cursor = end_of_file.saturating_sub(bpr_nibbles) + (self.cursor % bpr_nibbles); // stay on the same column
 			}
 
 			// we have an incomplete last line
 			else {
-				let last_line_length = end_of_file % 0x20;
-				let column_of_cursor = self.cursor % 0x20;
-							
-				let start_of_last_line = end_of_file - (end_of_file % 0x20);
+				let last_line_length = end_of_file % bpr_nibbles;
+				let column_of_cursor = self.cursor % bpr_nibbles;
+
+				let start_of_last_line = end_of_file - (end_of_file % bpr_nibbles);
 
 				// cursor is on the last line
 				if column_of_cursor < last_line_length {
-					self.cursor = start_of_last_line + (self.cursor % 0x20);
+					self.cursor = start_of_last_line + (self.cursor % bpr_nibbles);
 				}
 				
 				// cursor is on the line just before the last, but can't go down
 				// without exceeding file size
 				else {
-					self.cursor = start_of_last_line.saturating_sub(0x20) + (self.cursor % 0x20);
+					self.cursor = start_of_last_line.saturating_sub(bpr_nibbles) + (self.cursor % bpr_nibbles);
 				}
 
 			}
 
-			if direction == 0x10 { // If we are moving the cursor down
-				self.change_offset(0x10); // move the view one line down
+			if direction == bpr as i64 { // If we are moving the cursor down
+				self.change_offset(bpr as i64); // move the view one line down
 			}
 			return;
 		}
@@ -1017,13 +1022,13 @@ impl App {
 
 		// case where the cursor is before what the screen displays
 		if self.cursor / 2 < self.offset {
-			self.offset = (self.cursor / 2) - (self.cursor / 2 % 0x10);
+			self.offset = (self.cursor / 2) - (self.cursor / 2 % bpr);
 		}
 
 		// case where the cursor is below what the screen displays
-		if self.cursor / 2 > self.offset + u64::from(self.lines_displayed) * 0x10 {
-			let cursor_line_start = (self.cursor / 2)  - (self.cursor / 2 % 0x10) ;
-			self.offset = cursor_line_start.saturating_sub(u64::from(self.lines_displayed - 1) * 0x10);
+		if self.cursor / 2 > self.offset + u64::from(self.lines_displayed) * bpr {
+			let cursor_line_start = (self.cursor / 2) - (self.cursor / 2 % bpr);
+			self.offset = cursor_line_start.saturating_sub(u64::from(self.lines_displayed - 1) * bpr);
 		}
 	}
 
@@ -1062,6 +1067,7 @@ impl App {
 
 	/// use to jump directly at an address (using a cursor address), and move the interface accordingly
 	pub fn cursor_jump_to(&mut self, new_cursor_address: u64) {
+		let bpr = self.bytes_per_row;
 		let mut new_address = new_cursor_address / 2;
 
 		// check that the address is not bellow the file
@@ -1071,15 +1077,15 @@ impl App {
 
 		// if address is not on the page currently displayed,
 		// jump on the address and display it in the middle of the page
-		if (new_address < self.offset) || new_address > self.offset + u64::from(self.lines_displayed)*0x10 - 1{
+		if (new_address < self.offset) || new_address > self.offset + u64::from(self.lines_displayed) * bpr - 1{
 			self.cursor = new_cursor_address;
 
 			// cursor should be in the middle of the screen:
 			// self.offset = self.cursor - (half the screen)
-			let lines_before_cursor = (u64::from(self.lines_displayed)/2) * 0x10;
+			let lines_before_cursor = (u64::from(self.lines_displayed)/2) * bpr;
 			self.offset = u64::saturating_sub(new_address, lines_before_cursor);
 
-			self.offset = self.offset - (self.offset %0x10); // align self.offset to 0x10
+			self.offset = self.offset - (self.offset % bpr); // align self.offset to bpr
 		
 		// the new address is displayed on the screen, just move the cursor
 		} else {

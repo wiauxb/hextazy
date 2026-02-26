@@ -16,17 +16,51 @@ pub fn ui(f: &mut Frame, app: &mut App) {
 	// Clear the screen
 	f.render_widget(Clear, f.area());
 
+	// Compute bytes_per_row from available terminal width.
+	//
+	// Fixed column costs:
+	//   address pane : 12 cols
+	//   preview pane : 33 cols (when a selection is active)
+	//
+	// Per-row column costs for n bytes (n must be a multiple of 8):
+	//   nsep = n/8 - 1   (number of ┊ separators; one after every 8th byte except the last)
+	//   hex pane inner  : 3*n + 2*nsep  (each byte = " XX", each separator = " ┊")
+	//   ascii pane inner: n + nsep	   (each byte = 1 char, each separator = "┊")
+	//
+	// combined inner = 4*n + 3*nsep = 4*n + 3*(n/8 - 1) = (35*n/8) - 3
+	// → pick largest multiple-of-8 n where (35*n/8 - 3) <= available
+	let preview_w: u16 = if app.selection_start.is_some() { 33 } else { 0 };
+	let terminal_w = f.area().width as i64;
+	let address_w: u16 = 9;
+	// fixed overhead = border(1) + address_w(9) + hex borders(1) + middle border(3) + ascii right border(2) = 15
+	let available = terminal_w - address_w as i64 - 7 - preview_w as i64;
+	// Pick the largest multiple-of-8 BPR that fits
+	let mut bpr: i64 = 8; // minimum (one group of 8)
+	for n in (1..=8_i64).rev() {
+		let candidate = n * 8; // multiples of 8: 64, 56, 48, ... 8
+		let nsep = n - 1; // separators for candidate bytes
+		if 4 * candidate + 3 * nsep <= available {
+			bpr = candidate;
+			break;
+		}
+	}
+	app.bytes_per_row = bpr as u64;
+
+	let nsep = bpr / 8 - 1;
+	let hex_w: u16 = (bpr as u16) * 3 + (nsep as u16) * 2 + 2 + 1;
+	let ascii_w: u16 = (bpr as u16) + (nsep as u16) + 1;
+
 	let contraints = match app.selection_start.is_some() {
 		true => [
-			Constraint::Max(9),
-			Constraint::Length(53),
-			Constraint::Length(18),
-			Constraint::Length(33) // We have a preview pane
+			Constraint::Length(address_w),
+			Constraint::Length(hex_w),
+			Constraint::Length(ascii_w),
+			Constraint::Length(preview_w) // We have a preview pane
 		],
 		false => [
-			Constraint::Max(9),
-			Constraint::Length(53),
-			Constraint::Length(18),
+			Constraint::Length(address_w),
+			Constraint::Length(hex_w),
+			Constraint::Length(ascii_w),
 			Constraint::Length(0) // No preview pane
 		]
 	};
@@ -124,16 +158,17 @@ fn render_address_block(app: &App, pane: Rect, f: &mut Frame) {
 	let remaining_file_size = app.length_to_end();
 
 	// don't write addresses after the last line
-	let mut end_address = match remaining_file_size < height * 16 {
-		true  => start_address + remaining_file_size,
-		false => start_address + height*16
+	let bpr = app.bytes_per_row;
+	let mut end_address = match remaining_file_size < height * bpr {
+		true => start_address + remaining_file_size,
+		false => start_address + height * bpr
 	};
 
 	if app.mode == Mode::Insert {
 		end_address += 1;
 	}
 
-	for i in (start_address..end_address).step_by(16) {
+	for i in (start_address..end_address).step_by(bpr as usize) {
 		list_items.push(
 			ListItem::new(Line::from(
 				Span::styled(format!("{:08x}", i),
@@ -200,20 +235,20 @@ fn render_hex_block(app: &mut App, pane: Rect, f: &mut Frame) {
 	let focused = app.editor_mode != CurrentEditor::AsciiEditor;
 
 	// Render every line of the Hex pane
-	for l in 0..app.lines_displayed {
+	let bpr = app.bytes_per_row;
 
+	for l in 0..app.lines_displayed {
 		// We use this to build a line of hex chars
 		let mut line: Vec<Span> = vec![];
 
 		// Render a line of the Hex pane
-		for i in 0..0x10 {
-
+		for i in 0..bpr {
 			// Colorize space between hex chars if the previous and next chars are selected
 			// or if the previous and next chars are part of a search result
 			// otherwise, just push a " " without background color
-			let current_byte: u64 = app.offset + u64::from(l) * 0x10 + i;
+			let current_byte: u64 = app.offset + u64::from(l) * bpr + i;
 			
-			if i == 0 || i == 8 { // don't colorize the initial, and the separator
+			if i % 8 == 0 { // don't colorize the initial, and the separator
 				line.push(Span::raw(" "));
 			}
 			// colorize the space between 2 bytes if selected
@@ -331,8 +366,8 @@ fn render_hex_block(app: &mut App, pane: Rect, f: &mut Frame) {
 				}
 			}
 
-			// add the stylish ┊ in the middle, color changes in hexyl mode
-			if i == 7 {
+			// add the stylish ┊ separator after every 8th byte (but not after the last byte), color changes in hexyl mode
+			if (i + 1) % 8 == 0 && i + 1 < bpr {
 				let separator_style = match app.show_infobar {
 					false => Style::default(),
 					true => Style::default().fg(Color::DarkGray),
@@ -407,29 +442,30 @@ fn render_ascii_block(app: &mut App, pane: Rect, f: &mut Frame) {
 		// We might want to change this in the future.
 		// This is because the app use to read 16 bytes into an array. And all the function
 		// were build using an array.
-		let (content, len) = app.read_16_length();
-		let mut buf: [u8; 16] = [0; 16];
+		let bpr = app.bytes_per_row as usize;
+		let (content, len) = app.read_n_length(bpr);
+		let mut buf: Vec<u8> = vec![0u8; bpr];
 
 		for i in 0..len {
 			buf[i] = content[i];
 		}
 
 		// if this is the line with the cursor
-		if (app.offset / 16) + u64::from(line) == app.cursor / 32 {
-
-			let line_cursor = app.cursor % 32;
+		let bpr64 = app.bytes_per_row;
+		if (app.offset / bpr64) + u64::from(line) == app.cursor / (bpr64 * 2) {
+			let line_cursor = app.cursor % (bpr64 * 2);
 			let cursor = (line_cursor / 2).try_into().unwrap();
 			let focused = app.editor_mode == CurrentEditor::AsciiEditor;
 
 			let mut ascii_colorized: Vec<Span> = vec![];
 
 
-			for i in 0..16 {
+			for i in 0..bpr {
 				if i < len { // display at most `len` chars
 								
 					if i == cursor { // highlight the cursor
 
-						let searched = app.is_searched(app.offset + u64::from(line) * 16 + i as u64);
+						let searched = app.is_searched(app.offset + u64::from(line) * bpr64 + i as u64);
 
 						let mut style = match (focused, searched) {
 							(true, _) => Style::default()
@@ -452,7 +488,7 @@ fn render_ascii_block(app: &mut App, pane: Rect, f: &mut Frame) {
 
 					} else {
 						let mut colorized_ascii = render_ascii_char(buf[i], app.braille);
-						if app.is_searched(app.offset + u64::from(line) * 16 + i as u64) {
+						if app.is_searched(app.offset + u64::from(line) * bpr64 + i as u64) {
 							colorized_ascii = colorized_ascii.style(SEACHED_STYLE);
 						}
 
@@ -475,8 +511,9 @@ fn render_ascii_block(app: &mut App, pane: Rect, f: &mut Frame) {
 				else {
 					ascii_colorized.push(Span::raw(" "));
 				}
-				
-				if i == 7 { // stylish ┊ in the middle
+
+				// add a ┊ separator after every 8th byte (but not after the last)
+				if (i + 1) % 8 == 0 && i + 1 < bpr {
 					let separator_style = match !app.show_infobar {
 						true  => {Style::default()},
 						false => {Style::default().fg(Color::DarkGray)},
@@ -490,10 +527,10 @@ fn render_ascii_block(app: &mut App, pane: Rect, f: &mut Frame) {
 				
 		} else {	// Ascii line without anything special
 			let mut ascii_colorized: Vec<Span> = vec![];
-			for i in 0..16 {
+			for i in 0..bpr {
 				if i < len {
 					let mut colorized_char = render_ascii_char(buf[i], app.braille);
-					if app.is_searched(app.offset + u64::from(line) * 16 + i as u64) {
+					if app.is_searched(app.offset + u64::from(line) * bpr64 + i as u64) {
 						colorized_char = colorized_char.style(SEACHED_STYLE);
 					}
 					ascii_colorized.push(colorized_char);
@@ -501,7 +538,8 @@ fn render_ascii_block(app: &mut App, pane: Rect, f: &mut Frame) {
 					ascii_colorized.push(Span::raw(" "));
 				}
 
-				if i == 7 {
+				// add a ┊ separator after every 8th byte (but not after the last)
+				if (i + 1) % 8 == 0 && i + 1 < bpr {
 					let separator_style = match !app.show_infobar {
 						true  => Style::default(),
 						false => Style::default().fg(Color::DarkGray),
